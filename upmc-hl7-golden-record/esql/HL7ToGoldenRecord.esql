@@ -1,0 +1,343 @@
+-- =============================================================================
+-- HL7ToGoldenRecord.esql
+--
+-- Parses an inbound HL7 v2.5 ADT^A01 message received as raw text over HTTP,
+-- extracts patient demographics, insurance, and diagnosis data, and produces
+-- a JSON "Golden Record Candidate" payload for downstream MDM consumption.
+--
+-- Segment mapping (mirrors the Python parser in hl7-patient-matching):
+--   MSH  ->  message metadata (control ID, timestamp)
+--   PID  ->  patient demographics (MRN, name, DOB, gender, address, SSN)
+--   PV1  ->  visit / encounter (class, admission type, attending physician)
+--   IN1  ->  insurance / coverage (payer, plan type, subscriber ID)
+--   DG1  ->  diagnosis (ICD-10 code + display)
+--
+-- Routing:
+--   Valid record   -> OutputTerminal "Out"  (HTTP 200 + JSON)
+--   Missing MRN    -> OutputTerminal "Error" (HTTP 422 + error detail)
+--
+-- Author:  Bob (IBM AI) + Jeff Trbovich
+-- =============================================================================
+
+CREATE COMPUTE MODULE HL7ToGoldenRecord
+
+    -- -------------------------------------------------------------------------
+    -- Main entry point.
+    -- Called by the ACE runtime for every message arriving on the input terminal.
+    -- -------------------------------------------------------------------------
+    CREATE FUNCTION Main() RETURNS BOOLEAN
+    BEGIN
+        DECLARE rawHL7     CHARACTER CAST(InputRoot.BLOB.BLOB AS CHARACTER CCSID 1208);
+        DECLARE segments   ROW;
+
+        -- Parse the raw HL7 text into a segments ROW so each segment
+        -- can be addressed by name (e.g. segments.PID, segments.MSH).
+        CALL ParseHL7Segments(rawHL7, segments);
+
+        -- Validate the minimum required field before doing any further work.
+        -- A missing MRN means we cannot create or match a Golden Record.
+        DECLARE mrn CHARACTER GetComponent(segments.PID, 3, 1);
+        IF mrn = '' OR mrn IS NULL THEN
+            CALL BuildErrorResponse('MISSING_MRN',
+                'PID-3 (MRN) is required but was not present in the message.');
+            RETURN TRUE;
+        END IF;
+
+        -- All required fields present — build the Golden Record candidate.
+        CALL BuildGoldenRecord(segments, mrn);
+        RETURN TRUE;
+    END;
+
+
+    -- -------------------------------------------------------------------------
+    -- ParseHL7Segments
+    --
+    -- Splits the raw HL7 text on carriage-return segment terminators and
+    -- populates a ROW with one field per segment name.  Only the first
+    -- occurrence of each segment type is retained (sufficient for ADT^A01).
+    --
+    -- HL7 field separator is '|'.  Component separator is '^'.
+    -- -------------------------------------------------------------------------
+    CREATE PROCEDURE ParseHL7Segments(IN rawMsg CHARACTER, OUT segs ROW)
+    BEGIN
+        DECLARE segList   CHARACTER rawMsg;
+        DECLARE segLine   CHARACTER;
+        DECLARE segName   CHARACTER;
+        DECLARE pos       INTEGER 1;
+        DECLARE nextPos   INTEGER;
+
+        -- Normalise: replace bare \n with \r so the split works regardless
+        -- of how the HTTP client encoded the line endings.
+        SET segList = REPLACE(rawMsg, X'0A', X'0D');
+
+        WHILE pos <= LENGTH(segList) DO
+            SET nextPos = POSITION(X'0D' IN segList FROM pos);
+            IF nextPos = 0 THEN
+                SET nextPos = LENGTH(segList) + 1;
+            END IF;
+
+            SET segLine = TRIM(SUBSTRING(segList FROM pos FOR nextPos - pos));
+
+            IF LENGTH(segLine) > 3 THEN
+                SET segName = SUBSTRING(segLine FROM 1 FOR 3);
+                -- Store only the first occurrence of each segment type.
+                IF FIELDVALUE(segs.*[NAME = segName]) IS NULL THEN
+                    SET segs.*[NAME = segName] = segLine;
+                END IF;
+            END IF;
+
+            SET pos = nextPos + 1;
+        END WHILE;
+    END;
+
+
+    -- -------------------------------------------------------------------------
+    -- GetField
+    --
+    -- Returns the Nth pipe-delimited field from an HL7 segment string.
+    -- Field index follows HL7 convention: field 1 is the first field
+    -- after the segment name (i.e. after the first '|').
+    --
+    -- Example:
+    --   GetField('PID|1||MRN000001^^^HOSPITAL^MR||Bashirian^...', 3)
+    --   returns 'MRN000001^^^HOSPITAL^MR'
+    -- -------------------------------------------------------------------------
+    CREATE FUNCTION GetField(IN segment CHARACTER, IN fieldIndex INTEGER)
+        RETURNS CHARACTER
+    BEGIN
+        DECLARE parts CHARACTER segment;
+        DECLARE i     INTEGER 0;
+        DECLARE start INTEGER 1;
+        DECLARE next  INTEGER;
+
+        WHILE i < fieldIndex DO
+            SET next = POSITION('|' IN parts FROM start);
+            IF next = 0 THEN
+                RETURN '';
+            END IF;
+            SET start = next + 1;
+            SET i = i + 1;
+        END WHILE;
+
+        SET next = POSITION('|' IN parts FROM start);
+        IF next = 0 THEN
+            RETURN SUBSTRING(parts FROM start);
+        ELSE
+            RETURN SUBSTRING(parts FROM start FOR next - start);
+        END IF;
+    END;
+
+
+    -- -------------------------------------------------------------------------
+    -- GetComponent
+    --
+    -- Returns the Nth caret-delimited component within an HL7 field.
+    -- Component index is 1-based.
+    --
+    -- Example:
+    --   GetComponent('MRN000001^^^HOSPITAL^MR', 1)  ->  'MRN000001'
+    --   GetComponent('Bashirian^Julianne^Austin^^II', 2)  ->  'Julianne'
+    -- -------------------------------------------------------------------------
+    CREATE FUNCTION GetComponent(IN segment CHARACTER,
+                                  IN fieldIndex INTEGER,
+                                  IN componentIndex INTEGER)
+        RETURNS CHARACTER
+    BEGIN
+        DECLARE field     CHARACTER GetField(segment, fieldIndex);
+        DECLARE i         INTEGER 1;
+        DECLARE start     INTEGER 1;
+        DECLARE next      INTEGER;
+
+        WHILE i < componentIndex DO
+            SET next = POSITION('^' IN field FROM start);
+            IF next = 0 THEN
+                RETURN '';
+            END IF;
+            SET start = next + 1;
+            SET i = i + 1;
+        END WHILE;
+
+        SET next = POSITION('^' IN field FROM start);
+        IF next = 0 THEN
+            RETURN SUBSTRING(field FROM start);
+        ELSE
+            RETURN SUBSTRING(field FROM start FOR next - start);
+        END IF;
+    END;
+
+
+    -- -------------------------------------------------------------------------
+    -- FormatHL7Date
+    --
+    -- Converts an HL7 compact date (YYYYMMDD) or datetime (YYYYMMDDHHMMSS)
+    -- into an ISO 8601 date string (YYYY-MM-DD).
+    -- Returns the original value unchanged if it does not match either format.
+    -- -------------------------------------------------------------------------
+    CREATE FUNCTION FormatHL7Date(IN hl7date CHARACTER) RETURNS CHARACTER
+    BEGIN
+        IF LENGTH(hl7date) >= 8 THEN
+            RETURN SUBSTRING(hl7date FROM 1 FOR 4) || '-' ||
+                   SUBSTRING(hl7date FROM 5 FOR 2) || '-' ||
+                   SUBSTRING(hl7date FROM 7 FOR 2);
+        END IF;
+        RETURN hl7date;
+    END;
+
+
+    -- -------------------------------------------------------------------------
+    -- MapGender
+    --
+    -- Maps HL7 PID-8 administrative sex codes to FHIR gender values.
+    -- -------------------------------------------------------------------------
+    CREATE FUNCTION MapGender(IN hl7gender CHARACTER) RETURNS CHARACTER
+    BEGIN
+        IF hl7gender = 'M' THEN RETURN 'male';   END IF;
+        IF hl7gender = 'F' THEN RETURN 'female'; END IF;
+        RETURN 'unknown';
+    END;
+
+
+    -- -------------------------------------------------------------------------
+    -- MapAdmissionType
+    --
+    -- Maps PV1-14 admission type codes to human-readable labels.
+    -- -------------------------------------------------------------------------
+    CREATE FUNCTION MapAdmissionType(IN code CHARACTER) RETURNS CHARACTER
+    BEGIN
+        IF code = 'R' THEN RETURN 'Routine';   END IF;
+        IF code = 'E' THEN RETURN 'Emergency'; END IF;
+        IF code = 'U' THEN RETURN 'Urgent';    END IF;
+        IF code = 'N' THEN RETURN 'Elective';  END IF;
+        RETURN code;
+    END;
+
+
+    -- -------------------------------------------------------------------------
+    -- BuildGoldenRecord
+    --
+    -- Assembles the JSON Golden Record Candidate from parsed segment data
+    -- and writes it to the output message tree as an HTTP 200 response.
+    --
+    -- JSON structure:
+    -- {
+    --   "goldenRecordCandidate": {
+    --     "mrn":         string,
+    --     "name":        { "family", "given", "middle", "suffix" },
+    --     "birthDate":   string (YYYY-MM-DD),
+    --     "gender":      string,
+    --     "ssn":         string,
+    --     "address":     { "street", "city", "state", "postalCode", "country" },
+    --     "phone":       string,
+    --     "encounter":   { "admissionType", "patientClass", "location",
+    --                      "attendingPhysician", "admitDateTime" },
+    --     "insurance":   { "payerName", "planType", "subscriberId",
+    --                      "groupNumber", "effectiveDate" },
+    --     "diagnosis":   { "icd10Code", "description", "onsetDateTime" },
+    --     "source":      { "messageControlId", "sendingApplication",
+    --                      "messageDateTime" }
+    --   }
+    -- }
+    -- -------------------------------------------------------------------------
+    CREATE PROCEDURE BuildGoldenRecord(IN segs ROW, IN mrn CHARACTER)
+    BEGIN
+        -- PID fields
+        DECLARE pidSeg    CHARACTER FIELDVALUE(segs.PID);
+        DECLARE mshSeg    CHARACTER FIELDVALUE(segs.MSH);
+        DECLARE pv1Seg    CHARACTER FIELDVALUE(segs.PV1);
+        DECLARE in1Seg    CHARACTER FIELDVALUE(segs.IN1);
+        DECLARE dg1Seg    CHARACTER FIELDVALUE(segs.DG1);
+
+        -- Patient name components (PID-5: family^given^middle^^suffix)
+        DECLARE nameFamily  CHARACTER GetComponent(pidSeg, 5, 1);
+        DECLARE nameGiven   CHARACTER GetComponent(pidSeg, 5, 2);
+        DECLARE nameMiddle  CHARACTER GetComponent(pidSeg, 5, 3);
+        DECLARE nameSuffix  CHARACTER GetComponent(pidSeg, 5, 5);
+
+        -- Address components (PID-11: street^^city^state^zip^country)
+        DECLARE addrStreet  CHARACTER GetComponent(pidSeg, 11, 1);
+        DECLARE addrCity    CHARACTER GetComponent(pidSeg, 11, 3);
+        DECLARE addrState   CHARACTER GetComponent(pidSeg, 11, 4);
+        DECLARE addrZip     CHARACTER GetComponent(pidSeg, 11, 5);
+        DECLARE addrCountry CHARACTER GetComponent(pidSeg, 11, 6);
+
+        -- Attending physician (PV1-7: id^family^given^^^title)
+        DECLARE attendFamily CHARACTER GetComponent(pv1Seg, 7, 2);
+        DECLARE attendGiven  CHARACTER GetComponent(pv1Seg, 7, 3);
+        DECLARE attendTitle  CHARACTER GetComponent(pv1Seg, 7, 6);
+
+        -- Diagnosis (DG1-3: code^description^system)
+        DECLARE dxCode   CHARACTER GetComponent(dg1Seg, 3, 1);
+        DECLARE dxDesc   CHARACTER GetComponent(dg1Seg, 3, 2);
+
+        -- Set HTTP response headers
+        SET OutputRoot.HTTPResponseHeader."Content-Type" = 'application/json';
+        SET OutputRoot.HTTPResponseHeader.":statusCode"  = 200;
+
+        -- Build JSON output in the message tree.
+        -- ACE will serialise this to the wire as JSON when the flow
+        -- uses a JSON domain on the output node.
+        SET OutputRoot.JSON.Data.goldenRecordCandidate.mrn = mrn;
+
+        SET OutputRoot.JSON.Data.goldenRecordCandidate.name.family = nameFamily;
+        SET OutputRoot.JSON.Data.goldenRecordCandidate.name.given  = nameGiven;
+        SET OutputRoot.JSON.Data.goldenRecordCandidate.name.middle = nameMiddle;
+        IF nameSuffix <> '' THEN
+            SET OutputRoot.JSON.Data.goldenRecordCandidate.name.suffix = nameSuffix;
+        END IF;
+
+        SET OutputRoot.JSON.Data.goldenRecordCandidate.birthDate = FormatHL7Date(GetField(pidSeg, 7));
+        SET OutputRoot.JSON.Data.goldenRecordCandidate.gender    = MapGender(GetField(pidSeg, 8));
+        SET OutputRoot.JSON.Data.goldenRecordCandidate.ssn       = GetField(pidSeg, 19);
+
+        SET OutputRoot.JSON.Data.goldenRecordCandidate.address.street     = addrStreet;
+        SET OutputRoot.JSON.Data.goldenRecordCandidate.address.city       = addrCity;
+        SET OutputRoot.JSON.Data.goldenRecordCandidate.address.state      = addrState;
+        SET OutputRoot.JSON.Data.goldenRecordCandidate.address.postalCode = addrZip;
+        SET OutputRoot.JSON.Data.goldenRecordCandidate.address.country    = addrCountry;
+
+        SET OutputRoot.JSON.Data.goldenRecordCandidate.phone = GetField(pidSeg, 13);
+
+        SET OutputRoot.JSON.Data.goldenRecordCandidate.encounter.admissionType     = MapAdmissionType(GetField(pv1Seg, 14));
+        SET OutputRoot.JSON.Data.goldenRecordCandidate.encounter.patientClass      = GetField(pv1Seg, 2);
+        SET OutputRoot.JSON.Data.goldenRecordCandidate.encounter.location          = GetComponent(pv1Seg, 3, 1) || ' / ' || GetComponent(pv1Seg, 3, 2);
+        SET OutputRoot.JSON.Data.goldenRecordCandidate.encounter.attendingPhysician = attendTitle || ' ' || attendFamily || ', ' || attendGiven;
+        SET OutputRoot.JSON.Data.goldenRecordCandidate.encounter.admitDateTime     = FormatHL7Date(GetField(pv1Seg, 44));
+
+        SET OutputRoot.JSON.Data.goldenRecordCandidate.insurance.payerName    = GetField(in1Seg, 4);
+        SET OutputRoot.JSON.Data.goldenRecordCandidate.insurance.planType     = GetField(in1Seg, 15);
+        SET OutputRoot.JSON.Data.goldenRecordCandidate.insurance.subscriberId = GetField(in1Seg, 36);
+        SET OutputRoot.JSON.Data.goldenRecordCandidate.insurance.groupNumber  = GetField(in1Seg, 8);
+        SET OutputRoot.JSON.Data.goldenRecordCandidate.insurance.effectiveDate = FormatHL7Date(GetField(in1Seg, 12));
+
+        SET OutputRoot.JSON.Data.goldenRecordCandidate.diagnosis.icd10Code     = dxCode;
+        SET OutputRoot.JSON.Data.goldenRecordCandidate.diagnosis.description   = dxDesc;
+        SET OutputRoot.JSON.Data.goldenRecordCandidate.diagnosis.onsetDateTime = FormatHL7Date(GetField(dg1Seg, 5));
+
+        SET OutputRoot.JSON.Data.goldenRecordCandidate.source.messageControlId  = GetField(mshSeg, 9);
+        SET OutputRoot.JSON.Data.goldenRecordCandidate.source.sendingApplication = GetField(mshSeg, 3);
+        SET OutputRoot.JSON.Data.goldenRecordCandidate.source.messageDateTime   = FormatHL7Date(GetField(mshSeg, 6));
+
+        PROPAGATE TO TERMINAL 'out';
+    END;
+
+
+    -- -------------------------------------------------------------------------
+    -- BuildErrorResponse
+    --
+    -- Writes a structured JSON error payload and propagates to the Error
+    -- terminal with HTTP 422 Unprocessable Entity.
+    -- -------------------------------------------------------------------------
+    CREATE PROCEDURE BuildErrorResponse(IN errorCode CHARACTER,
+                                         IN errorDetail CHARACTER)
+    BEGIN
+        SET OutputRoot.HTTPResponseHeader."Content-Type" = 'application/json';
+        SET OutputRoot.HTTPResponseHeader.":statusCode"  = 422;
+
+        SET OutputRoot.JSON.Data.error.code    = errorCode;
+        SET OutputRoot.JSON.Data.error.detail  = errorDetail;
+        SET OutputRoot.JSON.Data.error.source  = 'UPMC-HL7-GoldenRecord-Flow';
+
+        PROPAGATE TO TERMINAL 'out';
+    END;
+
+END MODULE;

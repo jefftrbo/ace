@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  HL7GoldenRecordFlow.msgflow
+  ===========================
+  IBM ACE message flow — HL7 v2.5 ADT^A01 to Golden Record Candidate (JSON)
+
+  Flow topology:
+    HTTP Input  ->  HL7ToGoldenRecord (ESQL Compute)  ->  HTTP Reply
+                                                      ->  HTTP Reply (error path)
+
+  Deployment:
+    - Deploy via BAR file to the ace-server Podman container
+    - Listens on HTTP port 7800, path /hl7/golden-record
+    - Content-Type on inbound request: x-application/hl7-v2+er7 (raw HL7 text)
+-->
+<ecore:EPackage xmlns:ecore="http://www.eclipse.org/emf/2002/Ecore"
+                xmlns:XMI="http://www.omg.org/XMI"
+                xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                xmlns:broker="http://www.ibm.com/broker/2004/09/msgflow"
+                xsi:type="broker:MsgFlow"
+                name="HL7GoldenRecordFlow"
+                description="Parses HL7 ADT^A01 and produces a JSON Golden Record Candidate for MDM"
+                version="0.0.1">
+
+  <!-- HTTP Input node — receives raw HL7 over HTTP POST -->
+  <nodes xsi:type="broker:HTTPInputNode"
+         id="HTTPInput"
+         label="HL7 Admit (ADT^A01)"
+         urlSpecifier="/hl7/golden-record"
+         parseMethod="BLOB"
+         outputTerminalName="out">
+    <transitions xsi:type="broker:Transition"
+                 targetNode="HL7ToGoldenRecord"
+                 targetTerminal="in"/>
+  </nodes>
+
+  <!-- ESQL Compute node — parses HL7, validates, transforms to JSON -->
+  <nodes xsi:type="broker:ComputeNode"
+         id="HL7ToGoldenRecord"
+         label="HL7 → Golden Record"
+         computeExpression="esql://HL7ToGoldenRecord#HL7ToGoldenRecord"
+         inputTerminalName="in"
+         outputTerminalName="out">
+    <transitions xsi:type="broker:Transition"
+                 targetNode="HTTPReply"
+                 targetTerminal="in"/>
+  </nodes>
+
+  <!-- HTTP Reply node — returns 200 (valid) or 422 (error) -->
+  <nodes xsi:type="broker:HTTPReplyNode"
+         id="HTTPReply"
+         label="HTTP Reply"
+         inputTerminalName="in"/>
+
+</ecore:EPackage>

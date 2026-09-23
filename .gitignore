@@ -1,0 +1,27 @@
+# ACE build output
+*.bar
+*.zip
+*.jar
+
+# ACE Toolkit workspace artifacts
+**/.metadata/
+**/RemoteSystemsTempFiles/
+**/.settings/
+**/.project
+**/.classpath
+
+# Environment / secrets
+.env
+*.env
+*.pem
+*.key
+
+# macOS
+.DS_Store
+
+# Node (if any tooling added later)
+node_modules/
+
+# Python (if any tooling added later)
+__pycache__/
+*.pyc
