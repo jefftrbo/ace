@@ -1,0 +1,70 @@
+swagger: "2.0"
+info:
+  title: UPMC HL7 Golden Record API
+  description: >
+    Accepts raw HL7 v2.5 ADT^A01 messages over HTTP POST and returns
+    a JSON Golden Record Candidate for downstream MDM processing.
+  version: "1.0"
+basePath: /hl7
+consumes:
+  - text/plain
+produces:
+  - application/json
+paths:
+  /golden-record:
+    post:
+      summary: Parse HL7 ADT^A01 and return Golden Record Candidate
+      description: >
+        POST a raw HL7 v2 ADT^A01 message as plain text.
+        Returns a structured JSON Golden Record Candidate (HTTP 200)
+        or a validation error (HTTP 422) if required fields are missing.
+      operationId: parseHL7ToGoldenRecord
+      parameters:
+        - in: body
+          name: hl7Message
+          description: Raw HL7 v2.5 ADT^A01 message text
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Golden Record Candidate JSON
+          schema:
+            $ref: "#/definitions/GoldenRecordResponse"
+        "422":
+          description: Validation error — required field missing
+          schema:
+            $ref: "#/definitions/ErrorResponse"
+definitions:
+  GoldenRecordResponse:
+    type: object
+    properties:
+      goldenRecordCandidate:
+        type: object
+        properties:
+          mrn:
+            type: string
+          name:
+            type: object
+          birthDate:
+            type: string
+          gender:
+            type: string
+          insurance:
+            type: object
+          diagnosis:
+            type: object
+          source:
+            type: object
+  ErrorResponse:
+    type: object
+    properties:
+      error:
+        type: object
+        properties:
+          code:
+            type: string
+          detail:
+            type: string
+          source:
+            type: string

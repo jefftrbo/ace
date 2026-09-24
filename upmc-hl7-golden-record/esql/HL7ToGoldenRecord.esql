@@ -28,15 +28,19 @@ CREATE COMPUTE MODULE HL7ToGoldenRecord
     CREATE FUNCTION Main() RETURNS BOOLEAN
     BEGIN
         DECLARE rawHL7     CHARACTER CAST(InputRoot.BLOB.BLOB AS CHARACTER CCSID 1208);
-        DECLARE segments   ROW;
 
-        -- Parse the raw HL7 text into a segments ROW so each segment
-        -- can be addressed by name (e.g. segments.PID, segments.MSH).
-        CALL ParseHL7Segments(rawHL7, segments);
+        -- Create a working environment tree node to hold parsed segments.
+        -- ESQL does not support ROW as a local variable type in ACE v11;
+        -- we use the Environment tree instead for named segment storage.
+        SET Environment.Variables.segments = NULL;
+
+        -- Parse the raw HL7 text into Environment.Variables.segments so each
+        -- segment can be addressed by name (e.g. .segments.PID, .segments.MSH).
+        CALL ParseHL7Segments(rawHL7);
 
         -- Validate the minimum required field before doing any further work.
         -- A missing MRN means we cannot create or match a Golden Record.
-        DECLARE mrn CHARACTER GetComponent(segments.PID, 3, 1);
+        DECLARE mrn CHARACTER GetComponent(Environment.Variables.segments.PID, 3, 1);
         IF mrn = '' OR mrn IS NULL THEN
             CALL BuildErrorResponse('MISSING_MRN',
                 'PID-3 (MRN) is required but was not present in the message.');
@@ -44,7 +48,7 @@ CREATE COMPUTE MODULE HL7ToGoldenRecord
         END IF;
 
         -- All required fields present — build the Golden Record candidate.
-        CALL BuildGoldenRecord(segments, mrn);
+        CALL BuildGoldenRecord(mrn);
         RETURN TRUE;
     END;
 
@@ -53,12 +57,13 @@ CREATE COMPUTE MODULE HL7ToGoldenRecord
     -- ParseHL7Segments
     --
     -- Splits the raw HL7 text on carriage-return segment terminators and
-    -- populates a ROW with one field per segment name.  Only the first
-    -- occurrence of each segment type is retained (sufficient for ADT^A01).
+    -- stores each segment by name in Environment.Variables.segments.
+    -- Only the first occurrence of each segment type is retained (sufficient
+    -- for ADT^A01).
     --
     -- HL7 field separator is '|'.  Component separator is '^'.
     -- -------------------------------------------------------------------------
-    CREATE PROCEDURE ParseHL7Segments(IN rawMsg CHARACTER, OUT segs ROW)
+    CREATE PROCEDURE ParseHL7Segments(IN rawMsg CHARACTER)
     BEGIN
         DECLARE segList   CHARACTER rawMsg;
         DECLARE segLine   CHARACTER;
@@ -80,9 +85,21 @@ CREATE COMPUTE MODULE HL7ToGoldenRecord
 
             IF LENGTH(segLine) > 3 THEN
                 SET segName = SUBSTRING(segLine FROM 1 FOR 3);
-                -- Store only the first occurrence of each segment type.
-                IF FIELDVALUE(segs.*[NAME = segName]) IS NULL THEN
-                    SET segs.*[NAME = segName] = segLine;
+                -- ACE v11 ESQL does not support dynamic field name assignment
+                -- via correlation names.  Explicitly map the five ADT^A01
+                -- segments we need — first occurrence wins.
+                IF segName = 'MSH' AND Environment.Variables.segments.MSH IS NULL THEN
+                    SET Environment.Variables.segments.MSH = segLine;
+                ELSEIF segName = 'EVN' AND Environment.Variables.segments.EVN IS NULL THEN
+                    SET Environment.Variables.segments.EVN = segLine;
+                ELSEIF segName = 'PID' AND Environment.Variables.segments.PID IS NULL THEN
+                    SET Environment.Variables.segments.PID = segLine;
+                ELSEIF segName = 'PV1' AND Environment.Variables.segments.PV1 IS NULL THEN
+                    SET Environment.Variables.segments.PV1 = segLine;
+                ELSEIF segName = 'IN1' AND Environment.Variables.segments.IN1 IS NULL THEN
+                    SET Environment.Variables.segments.IN1 = segLine;
+                ELSEIF segName = 'DG1' AND Environment.Variables.segments.DG1 IS NULL THEN
+                    SET Environment.Variables.segments.DG1 = segLine;
                 END IF;
             END IF;
 
@@ -238,14 +255,14 @@ CREATE COMPUTE MODULE HL7ToGoldenRecord
     --   }
     -- }
     -- -------------------------------------------------------------------------
-    CREATE PROCEDURE BuildGoldenRecord(IN segs ROW, IN mrn CHARACTER)
+    CREATE PROCEDURE BuildGoldenRecord(IN mrn CHARACTER)
     BEGIN
-        -- PID fields
-        DECLARE pidSeg    CHARACTER FIELDVALUE(segs.PID);
-        DECLARE mshSeg    CHARACTER FIELDVALUE(segs.MSH);
-        DECLARE pv1Seg    CHARACTER FIELDVALUE(segs.PV1);
-        DECLARE in1Seg    CHARACTER FIELDVALUE(segs.IN1);
-        DECLARE dg1Seg    CHARACTER FIELDVALUE(segs.DG1);
+        -- Pull segment strings from the Environment tree
+        DECLARE pidSeg    CHARACTER FIELDVALUE(Environment.Variables.segments.PID);
+        DECLARE mshSeg    CHARACTER FIELDVALUE(Environment.Variables.segments.MSH);
+        DECLARE pv1Seg    CHARACTER FIELDVALUE(Environment.Variables.segments.PV1);
+        DECLARE in1Seg    CHARACTER FIELDVALUE(Environment.Variables.segments.IN1);
+        DECLARE dg1Seg    CHARACTER FIELDVALUE(Environment.Variables.segments.DG1);
 
         -- Patient name components (PID-5: family^given^middle^^suffix)
         DECLARE nameFamily  CHARACTER GetComponent(pidSeg, 5, 1);
